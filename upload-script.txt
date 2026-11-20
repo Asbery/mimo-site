@@ -1,0 +1,109 @@
+"""Lädt alle Videos aus queue/*.json über die YouTube Data API hoch.
+
+Jede Queue-Datei beschreibt ein Video:
+{"file": "videos/x.mp4", "title": "...", "description": "...", "tags": ["..."],
+ "privacy": "private|unlisted|public", "publish_at": "2026-11-20T17:00:00Z" (optional),
+ "thumbnail": "videos/x.png" (optional)}
+Nach erfolgreichem Upload wird die Datei mit der Video-ID nach done/ verschoben.
+"""
+import glob, json, os, sys, shutil
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaFileUpload
+
+SCOPES = ["https://www.googleapis.com/auth/youtube", "https://www.googleapis.com/auth/youtube.force-ssl"]
+
+def client():
+    creds = Credentials(
+        token=None,
+        refresh_token=os.environ["YT_REFRESH_TOKEN"],
+        client_id=os.environ["YT_CLIENT_ID"],
+        client_secret=os.environ["YT_CLIENT_SECRET"],
+        token_uri="https://oauth2.googleapis.com/token",
+    )
+    return build("youtube", "v3", credentials=creds, cache_discovery=False)
+
+def upload(yt, item):
+    status = {
+        "privacyStatus": item.get("privacy", "private"),
+        "selfDeclaredMadeForKids": False,
+        "containsSyntheticMedia": True,
+    }
+    if item.get("publish_at"):
+        status["privacyStatus"] = "private"
+        status["publishAt"] = item["publish_at"]
+    body = {
+        "snippet": {
+            "title": item["title"][:100],
+            "description": item.get("description", ""),
+            "tags": item.get("tags", []),
+            "categoryId": item.get("category", "1"),  # Film & Animation
+        },
+        "status": status,
+    }
+    media = MediaFileUpload(item["file"], chunksize=8 * 1024 * 1024, resumable=True)
+    try:
+        req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
+        return _run(yt, req, item)
+    except HttpError as e:
+        if "containsSyntheticMedia" in str(e):
+            body["status"].pop("containsSyntheticMedia", None)
+            media = MediaFileUpload(item["file"], chunksize=8 * 1024 * 1024, resumable=True)
+            req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
+            return _run(yt, req, item)
+        raise
+
+def _run(yt, req, item):
+    resp = None
+    while resp is None:
+        prog, resp = req.next_chunk()
+        if prog:
+            print(f"  {int(prog.progress() * 100)} %")
+    vid = resp["id"]
+    if item.get("thumbnail"):
+        try:
+            yt.thumbnails().set(videoId=vid, media_body=MediaFileUpload(item["thumbnail"])).execute()
+        except HttpError as e:
+            print("  Thumbnail übersprungen:", e)
+    return vid, resp["status"]
+
+def main():
+    import builtins, traceback
+    os.makedirs("logs", exist_ok=True)
+    log = open("logs/last_run.txt", "w")
+    _p = builtins.print
+    def tee(*a, **k):
+        _p(*a, **k); _p(*a, file=log, flush=True)
+    builtins.print = tee
+    try:
+        _main()
+    except SystemExit:
+        raise
+    except Exception:
+        print(traceback.format_exc()); sys.exit(1)
+
+def _main():
+    files = sorted(glob.glob("queue/*.json"))
+    if not files:
+        print("Queue leer.")
+        return
+    yt = client()
+    failed = 0
+    for path in files:
+        item = json.load(open(path))
+        print("Lade hoch:", item["title"])
+        try:
+            vid, st = upload(yt, item)
+        except HttpError as e:
+            print("  FEHLER:", e)
+            failed += 1
+            continue
+        item.update({"video_id": vid, "url": f"https://youtu.be/{vid}", "result_status": st})
+        print("  OK:", item["url"], "| Status:", st.get("privacyStatus"))
+        json.dump(item, open(os.path.join("done", os.path.basename(path)), "w"), indent=2, ensure_ascii=False)
+        os.remove(path)
+    sys.exit(1 if failed else 0)
+
+if __name__ == "__main__":
+    main()
